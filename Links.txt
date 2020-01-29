@@ -1,0 +1,7 @@
+Annex WI-FI RDS is a powerful scripts interpreter for the popular ESP8266 WI-FI module. 
+The module can be managed with a dedicated WEB IDE and an associated AnnexToolKit utility suite.
+Annex WI-FI RDS provides the following main functionalities:
+
+https://www.sites.google.com/site/annexwifi/
+
+======================================================================================
