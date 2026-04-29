@@ -1,63 +1,130 @@
-/**
-   Датчик SR-04P для определения остатка гранул в бункере, датчики температуры для котла и бойлера
+/*
+  ESP8266 (NodeMCU) Boiler + Distance Monitor
+  FIXED / MODERNIZED VERSION:
+  ✔ MQTT via hostname (no hardcoded IP)
+  ✔ Better WiFi reconnect
+  ✔ MQTT connect result logging
+  ✔ No silent failures
+  ✔ Safe publish helper
+  ✔ DeepSleep stability
+  ✔ MQTT socket timeout
+  ✔ Optional Last Will
+  ✔ Better Dallas handling
+  ✔ pulseIn timeout
+  ✔ Serial debug
+  ✔ Works better after router / HA IP changes
 
-   static const uint8_t D0   = 16;
-   static const uint8_t D1   = 5;
-   static const uint8_t D2   = 4;
-   static const uint8_t D3   = 0;
-   static const uint8_t D4   = 2;
-   static const uint8_t D5   = 14;
-   static const uint8_t D6   = 12;
-   static const uint8_t D7   = 13;
-   static const uint8_t D8   = 15;
-   static const uint8_t D9   = 3;
-   static const uint8_t D10  = 1;
+  IMPORTANT:
+  GPIO16 (D0) MUST be connected to RST for DeepSleep wakeup
 */
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
-//#include <ArduinoJson.h>
 
-//SR-04
-const int trigPin = 13;  //D7
-const int echoPin = 12;  //D6
+// =========================
+// PINOUT (NodeMCU)
+// =========================
+static const uint8_t D0  = 16;
+static const uint8_t D1  = 5;
+static const uint8_t D6  = 12;
+static const uint8_t D7  = 13;
 
-//DALLAS
-#define PIN_DS18B20 5 //D1
-int countDallasSensors;
+// =========================
+// SR-04
+// =========================
+const int trigPin = D7;
+const int echoPin = D6;
 
-//VARIABLES
-long SR_Duration;
-int SR_Distance;
-float tempBoiler;
-float tempPot;
+// =========================
+// DALLAS
+// =========================
+#define PIN_DS18B20 D1
 
-//NETWORK
-byte mqtt_server[] = { 192, 168, 1, 231 };
-char buffer[10];
-// WiFi credentials.
+// =========================
+// NETWORK
+// =========================
 const char* WIFI_SSID = "#";
 const char* WIFI_PASS = "#";
 
-const char* MQTT_SSID = "#";
+const char* MQTT_USER = "#";
 const char* MQTT_PASS = "#";
 
+// Use hostname instead of IP
+// Examples:
+// homeassistant.local
+// raspberrypi.local
+const char* MQTT_HOST = "homeassistant.local";
+const int MQTT_PORT = 1883;
 
+// =========================
+// VARIABLES
+// =========================
+long SR_Duration = 0;
+int SR_Distance = 0;
+
+float tempBoiler = -127;
+float tempPot = -127;
+
+int countDallasSensors = 0;
+
+unsigned long lastReconnectAttempt = 0;
+
+// =========================
+// OBJECTS
+// =========================
 OneWire oneWire(PIN_DS18B20);
 DallasTemperature dallasSensors(&oneWire);
 
-void MQTTMessage(char* topic, byte* payload, unsigned int length) {
+WiFiClient wifiClient;
+PubSubClient client(wifiClient);
 
+// =========================
+// MQTT CALLBACK
+// =========================
+void MQTTMessage(char* topic, byte* payload, unsigned int length) {
+  Serial.print("MQTT Message [");
+  Serial.print(topic);
+  Serial.print("]: ");
+
+  for (unsigned int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+
+  Serial.println();
 }
 
-WiFiClient wifiClient;
-PubSubClient client(mqtt_server, 1883, MQTTMessage, wifiClient);
+// =========================
+// SAFE PUBLISH
+// =========================
+bool publishValue(const char* topic, String value, bool retained = true) {
+  bool result = client.publish(topic, value.c_str(), retained);
 
-void connectWIFI() {
+  Serial.print("Publish -> ");
+  Serial.print(topic);
+  Serial.print(" = ");
+  Serial.print(value);
+  Serial.print(" | ");
+  Serial.println(result ? "OK" : "FAIL");
+
+  return result;
+}
+
+// =========================
+// WIFI
+// =========================
+bool connectWIFI() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
+  Serial.println("Connecting to WiFi...");
+
   WiFi.persistent(false);
   WiFi.mode(WIFI_OFF);
+  delay(500);
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
@@ -65,106 +132,192 @@ void connectWIFI() {
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
+    Serial.print(".");
 
-    // Only try for 5 seconds.
-    if (millis() - wifiConnectStart > 5000) {
-      return;
+    // 15 sec timeout
+    if (millis() - wifiConnectStart > 15000) {
+      Serial.println("\nWiFi FAILED");
+      return false;
     }
   }
+
+  Serial.println("\nWiFi Connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  return true;
 }
 
-void reconnectMQTT() {
-  // Loop until we're reconnected
-  while (!client.connected()) {
-    Serial.println("Reconnect to MQTT");
-    client.connect("ESP8266 Thermostate", MQTT_SSID, MQTT_PASS);
-    client.publish("outTopic", "connecting..");
-    delay(5000);
+// =========================
+// MQTT
+// =========================
+bool reconnectMQTT() {
+  if (client.connected()) {
+    return true;
+  }
+
+  Serial.println("Connecting to MQTT...");
+
+  String clientId = "ESP8266-Thermostat-";
+  clientId += String(ESP.getChipId());
+
+  bool connected = client.connect(
+    clientId.c_str(),
+    MQTT_USER,
+    MQTT_PASS,
+    "ESP/ToHome/status",
+    1,
+    true,
+    "offline"
+  );
+
+  if (connected) {
+    Serial.println("MQTT Connected");
+
+    publishValue("ESP/ToHome/status", "online");
+    publishValue("ESP/ToHome/boot", "booted");
+
+    return true;
+  } else {
+    Serial.print("MQTT FAILED, rc=");
+    Serial.println(client.state());
+
+    return false;
   }
 }
 
+// =========================
+// DISTANCE
+// =========================
 void getDistance() {
-  // Clears the trigPin
   digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
+  delayMicroseconds(5);
 
-  // Sets the trigPin on HIGH state for 10 micro seconds
   digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  // Reads the echoPin, returns the sound wave travel time in microseconds
-  SR_Duration = pulseIn(echoPin, HIGH);
+  // timeout prevents blocking forever
+  SR_Duration = pulseIn(echoPin, HIGH, 30000);
 
-  // Calculating the distance
+  if (SR_Duration == 0) {
+    SR_Distance = -1;
+    Serial.println("Distance timeout");
+    return;
+  }
+
   SR_Distance = SR_Duration * 0.034 / 2;
+
+  Serial.print("Distance: ");
+  Serial.println(SR_Distance);
 }
 
-void getTemperature(){
-  dallasSensors.requestTemperatures(); 
-  delay(1000);
+// =========================
+// TEMPERATURE
+// =========================
+void getTemperature() {
+  dallasSensors.requestTemperatures();
+
   tempBoiler = dallasSensors.getTempCByIndex(0);
-  tempPot = dallasSensors.getTempCByIndex(1);
+
+  if (countDallasSensors > 1) {
+    tempPot = dallasSensors.getTempCByIndex(1);
+  } else {
+    tempPot = -127;
+  }
+
+  Serial.print("Boiler Temp: ");
+  Serial.println(tempBoiler);
+
+  Serial.print("Pot Temp: ");
+  Serial.println(tempPot);
 }
 
-void sendToServer(int distance, double tempBoiler, double tempPot, int countDallasSensors) {
-  client.publish("outTopic", "connected");
-  if(distance < 150 && distance > 0){
-    client.publish("ESP/ToHome/distance", String(distance).c_str());
-  }
-  if(tempBoiler < 150 && tempBoiler > 0){
-    client.publish("ESP/ToHome/tempBoiler", String(tempBoiler).c_str());
-  }
-  if(tempPot < 150 && tempPot > 0){
-    client.publish("ESP/ToHome/tempPot", String(tempPot).c_str());
+// =========================
+// SEND
+// =========================
+void sendToServer() {
+  if (SR_Distance > 0 && SR_Distance < 150) {
+    publishValue("ESP/ToHome/distance", String(SR_Distance));
   }
 
-  client.publish("ESP/ToHome/countDallasSensors", String(countDallasSensors).c_str());
+  if (tempBoiler > -50 && tempBoiler < 150) {
+    publishValue("ESP/ToHome/tempBoiler", String(tempBoiler, 2));
+  }
+
+  if (tempPot > -50 && tempPot < 150) {
+    publishValue("ESP/ToHome/tempPot", String(tempPot, 2));
+  }
+
+  publishValue("ESP/ToHome/countDallasSensors", String(countDallasSensors));
+
   Serial.println("Reported!");
-  delay(1000);
 }
 
-void toDeepSleep(){
-    client.disconnect();
-    WiFi.disconnect();
-    delay(1000);
-    Serial.println("Sleeping..");
-    delay(20);
-    ESP.deepSleep(60e6);
-    
+// =========================
+// SLEEP
+// =========================
+void toDeepSleep() {
+  Serial.println("Preparing Deep Sleep...");
+
+  client.loop();
+  delay(300);
+
+  client.disconnect();
+  WiFi.disconnect(true);
+
+  delay(500);
+
+  Serial.println("Sleeping for 60 seconds...");
+  ESP.deepSleep(60e6);
 }
 
+// =========================
+// SETUP
+// =========================
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
+  delay(500);
 
-  // Wait for serial to initialize.
-  while (!Serial) { }
-  
-  dallasSensors.begin();
+  Serial.println();
+  Serial.println("Device Booting...");
+  Serial.println("-------------------------------------");
+
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
 
+  dallasSensors.begin();
   countDallasSensors = dallasSensors.getDeviceCount();
+
+  Serial.print("Dallas sensors found: ");
+  Serial.println(countDallasSensors);
+
+  client.setServer(MQTT_HOST, MQTT_PORT);
+  client.setCallback(MQTTMessage);
+  client.setSocketTimeout(10);
+
   connectWIFI();
-  
-  Serial.println("Device Started");
-  Serial.println("-------------------------------------");
 }
 
+// =========================
+// LOOP
+// =========================
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWIFI();
-  }
-
-  if (!client.connected()) {
-    reconnectMQTT();
-  }
-
-  if (client.connected()) {
-    getDistance();
-    getTemperature();
-    sendToServer(SR_Distance, tempBoiler, tempPot, countDallasSensors);
+  if (!connectWIFI()) {
+    Serial.println("WiFi unavailable -> sleep");
     toDeepSleep();
   }
+
+  if (!reconnectMQTT()) {
+    Serial.println("MQTT unavailable -> sleep");
+    toDeepSleep();
+  }
+
   client.loop();
+
+  getDistance();
+  getTemperature();
+  sendToServer();
+
+  toDeepSleep();
 }
